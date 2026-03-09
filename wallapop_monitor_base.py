@@ -1,4 +1,4 @@
-﻿import os
+import os
 import re
 import time
 import uuid
@@ -68,7 +68,6 @@ TELEGRAM_CHAT_ID = env_str("TELEGRAM_CHAT_ID", "PON_AQUI_TU_CHAT_ID")
 WALLAPOP_APP_VERSION = env_str("WALLAPOP_APP_VERSION", "8.1737.0")
 WALLAPOP_APP_VERSION_HEADER = env_str("WALLAPOP_APP_VERSION_HEADER", WALLAPOP_APP_VERSION.replace(".", ""))
 FILTER_TODAY_ONLY = env_bool("FILTER_TODAY_ONLY", True)
-EXCLUDE_RESERVED_ITEMS = env_bool("EXCLUDE_RESERVED_ITEMS", True)
 PORT = int(env_str("PORT", "8080"))
 
 HEADERS = {
@@ -343,28 +342,6 @@ def fetch_search_results_legacy_html(search_url: str) -> list[dict]:
     return items
 
 
-def is_reserved_or_sold(item: dict[str, Any]) -> bool:
-    status = normalize_text(item.get("status") or item.get("item_status") or item.get("state"))
-    if status in {"reserved", "reservado", "sold", "vendido"}:
-        return True
-
-    for key in ("reserved", "is_reserved", "sold", "is_sold"):
-        if bool(item.get(key)):
-            return True
-
-    flags = item.get("flags")
-    if isinstance(flags, dict):
-        for key in ("reserved", "is_reserved", "sold", "is_sold"):
-            if bool(flags.get(key)):
-                return True
-    elif isinstance(flags, list):
-        joined_flags = normalize_text(" ".join(str(x) for x in flags))
-        if "reserv" in joined_flags or "sold" in joined_flags or "vendid" in joined_flags:
-            return True
-
-    return False
-
-
 def fetch_search_results(rule: sqlite3.Row) -> list[dict]:
     search_url = build_search_url(rule)
     params: dict[str, Any] = {
@@ -392,15 +369,11 @@ def fetch_search_results(rule: sqlite3.Row) -> list[dict]:
         )
 
         items: list[dict] = []
-        skipped_unavailable = 0
         for raw in raw_items:
             if not isinstance(raw, dict):
                 continue
             created_at = raw.get("created_at")
             if FILTER_TODAY_ONLY and not is_created_today_utc(created_at):
-                continue
-            if EXCLUDE_RESERVED_ITEMS and is_reserved_or_sold(raw):
-                skipped_unavailable += 1
                 continue
 
             item_id = str(raw.get("id") or "").strip()
@@ -422,10 +395,7 @@ def fetch_search_results(rule: sqlite3.Row) -> list[dict]:
                 }
             )
 
-        suffix = ""
-        if EXCLUDE_RESERVED_ITEMS:
-            suffix = f" (reservados/vendidos filtrados={skipped_unavailable})"
-        logging.info("Wallapop API: %s resultados para %s%s", len(items), rule["name"], suffix)
+        logging.info("Wallapop API: %s resultados para %s", len(items), rule["name"])
         return items
     except Exception as exc:
         logging.exception("Fallo en API de Wallapop, usando fallback HTML: %s", exc)
@@ -1116,4 +1086,3 @@ if __name__ == "__main__":
     init_db()
     start_background_monitor_once()
     app.run(host="0.0.0.0", port=PORT, debug=False)
-
