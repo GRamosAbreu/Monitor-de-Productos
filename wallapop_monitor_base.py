@@ -5,6 +5,7 @@ import uuid
 import sqlite3
 import logging
 import threading
+import unicodedata
 from pathlib import Path
 from collections import Counter
 from contextlib import contextmanager
@@ -67,6 +68,7 @@ TELEGRAM_CHAT_ID = env_str("TELEGRAM_CHAT_ID", "PON_AQUI_TU_CHAT_ID")
 WALLAPOP_APP_VERSION = env_str("WALLAPOP_APP_VERSION", "8.1737.0")
 WALLAPOP_APP_VERSION_HEADER = env_str("WALLAPOP_APP_VERSION_HEADER", WALLAPOP_APP_VERSION.replace(".", ""))
 FILTER_TODAY_ONLY = env_bool("FILTER_TODAY_ONLY", True)
+EXCLUDE_RESERVED_ITEMS = env_bool("EXCLUDE_RESERVED_ITEMS", True)
 PORT = int(env_str("PORT", "8080"))
 
 HEADERS = {
@@ -113,6 +115,8 @@ def init_db():
                 description_must_include TEXT,
                 description_must_include_or TEXT,
                 must_not_include TEXT,
+                match_mode TEXT NOT NULL DEFAULT 'smart',
+                smart_min_score REAL NOT NULL DEFAULT 65,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -126,6 +130,10 @@ def init_db():
             cur.execute("ALTER TABLE watch_rules ADD COLUMN title_must_not_include TEXT")
         if "description_must_include_or" not in watch_rules_columns:
             cur.execute("ALTER TABLE watch_rules ADD COLUMN description_must_include_or TEXT")
+        if "match_mode" not in watch_rules_columns:
+            cur.execute("ALTER TABLE watch_rules ADD COLUMN match_mode TEXT NOT NULL DEFAULT 'smart'")
+        if "smart_min_score" not in watch_rules_columns:
+            cur.execute("ALTER TABLE watch_rules ADD COLUMN smart_min_score REAL NOT NULL DEFAULT 65")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS seen_items (
@@ -179,7 +187,28 @@ def login_required(view_func):
 def normalize_text(text: Optional[str]) -> str:
     if not text:
         return ""
-    return re.sub(r"\s+", " ", text).strip().lower()
+    # Remove accents to match variants like "edicion" vs "edición".
+    normalized = unicodedata.normalize("NFKD", str(text))
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return re.sub(r"\s+", " ", normalized).strip().lower()
+
+
+def get_rule_value(rule: sqlite3.Row, key: str, default: Any = None) -> Any:
+    try:
+        value = rule[key]
+    except Exception:
+        return default
+    if value is None:
+        return default
+    return value
+
+
+def clamp_score(value: Any, default: float = 65.0) -> float:
+    try:
+        score = float(value)
+    except Exception:
+        score = default
+    return max(0.0, min(100.0, score))
 
 
 def compact_text(text: Optional[str]) -> str:
@@ -314,6 +343,28 @@ def fetch_search_results_legacy_html(search_url: str) -> list[dict]:
     return items
 
 
+def is_reserved_or_sold(item: dict[str, Any]) -> bool:
+    status = normalize_text(item.get("status") or item.get("item_status") or item.get("state"))
+    if status in {"reserved", "reservado", "sold", "vendido"}:
+        return True
+
+    for key in ("reserved", "is_reserved", "sold", "is_sold"):
+        if bool(item.get(key)):
+            return True
+
+    flags = item.get("flags")
+    if isinstance(flags, dict):
+        for key in ("reserved", "is_reserved", "sold", "is_sold"):
+            if bool(flags.get(key)):
+                return True
+    elif isinstance(flags, list):
+        joined_flags = normalize_text(" ".join(str(x) for x in flags))
+        if "reserv" in joined_flags or "sold" in joined_flags or "vendid" in joined_flags:
+            return True
+
+    return False
+
+
 def fetch_search_results(rule: sqlite3.Row) -> list[dict]:
     search_url = build_search_url(rule)
     params: dict[str, Any] = {
@@ -341,11 +392,15 @@ def fetch_search_results(rule: sqlite3.Row) -> list[dict]:
         )
 
         items: list[dict] = []
+        skipped_unavailable = 0
         for raw in raw_items:
             if not isinstance(raw, dict):
                 continue
             created_at = raw.get("created_at")
             if FILTER_TODAY_ONLY and not is_created_today_utc(created_at):
+                continue
+            if EXCLUDE_RESERVED_ITEMS and is_reserved_or_sold(raw):
+                skipped_unavailable += 1
                 continue
 
             item_id = str(raw.get("id") or "").strip()
@@ -367,7 +422,10 @@ def fetch_search_results(rule: sqlite3.Row) -> list[dict]:
                 }
             )
 
-        logging.info("Wallapop API: %s resultados para %s", len(items), rule["name"])
+        suffix = ""
+        if EXCLUDE_RESERVED_ITEMS:
+            suffix = f" (reservados/vendidos filtrados={skipped_unavailable})"
+        logging.info("Wallapop API: %s resultados para %s%s", len(items), rule["name"], suffix)
         return items
     except Exception as exc:
         logging.exception("Fallo en API de Wallapop, usando fallback HTML: %s", exc)
@@ -387,12 +445,8 @@ def rule_match_details(rule: sqlite3.Row, title: str, description: str) -> tuple
     whole = f"{title_n} {desc_n}"
     reasons: list[str] = []
 
-    include_terms = split_csv(rule["title_must_include"])
-    try:
-        include_or_raw = rule["title_must_include_or"]
-    except Exception:
-        include_or_raw = None
-    include_or_terms = split_csv(include_or_raw)
+    include_terms = split_csv(get_rule_value(rule, "title_must_include", ""))
+    include_or_terms = split_csv(get_rule_value(rule, "title_must_include_or", ""))
     if include_terms or include_or_terms:
         include_ok = bool(include_terms) and all(contains_term(title_n, term) for term in include_terms)
         include_or_ok = bool(include_or_terms) and any(contains_term(title_n, term) for term in include_or_terms)
@@ -403,16 +457,12 @@ def rule_match_details(rule: sqlite3.Row, title: str, description: str) -> tuple
             if include_or_terms:
                 reasons.append(f"title_or:{'|'.join(include_or_terms)}")
 
-    for term in split_csv(rule["title_must_not_include"]):
+    for term in split_csv(get_rule_value(rule, "title_must_not_include", "")):
         if contains_term(title_n, term):
             reasons.append(f"title_excluded:{term}")
 
-    desc_include_terms = split_csv(rule["description_must_include"])
-    try:
-        desc_include_or_raw = rule["description_must_include_or"]
-    except Exception:
-        desc_include_or_raw = None
-    desc_include_or_terms = split_csv(desc_include_or_raw)
+    desc_include_terms = split_csv(get_rule_value(rule, "description_must_include", ""))
+    desc_include_or_terms = split_csv(get_rule_value(rule, "description_must_include_or", ""))
     if desc_include_terms or desc_include_or_terms:
         desc_include_ok = bool(desc_include_terms) and all(contains_term(desc_n, term) for term in desc_include_terms)
         desc_include_or_ok = bool(desc_include_or_terms) and any(contains_term(desc_n, term) for term in desc_include_or_terms)
@@ -423,15 +473,90 @@ def rule_match_details(rule: sqlite3.Row, title: str, description: str) -> tuple
             if desc_include_or_terms:
                 reasons.append(f"description_or:{'|'.join(desc_include_or_terms)}")
 
-    for term in split_csv(rule["must_not_include"]):
+    for term in split_csv(get_rule_value(rule, "must_not_include", "")):
         if contains_term(whole, term):
             reasons.append(f"excluded:{term}")
 
     return len(reasons) == 0, reasons
 
 
+def rule_match_smart_details(rule: sqlite3.Row, title: str, description: str) -> tuple[bool, float, list[str]]:
+    title_n = normalize_text(title)
+    desc_n = normalize_text(description)
+    whole = f"{title_n} {desc_n}"
+
+    title_required_terms = split_csv(get_rule_value(rule, "title_must_include", ""))
+    title_or_terms = split_csv(get_rule_value(rule, "title_must_include_or", ""))
+    desc_required_terms = split_csv(get_rule_value(rule, "description_must_include", ""))
+    desc_or_terms = split_csv(get_rule_value(rule, "description_must_include_or", ""))
+
+    reasons: list[str] = []
+    for term in split_csv(get_rule_value(rule, "title_must_not_include", "")):
+        if contains_term(title_n, term):
+            reasons.append(f"title_excluded:{term}")
+    for term in split_csv(get_rule_value(rule, "must_not_include", "")):
+        if contains_term(whole, term):
+            reasons.append(f"excluded:{term}")
+    if reasons:
+        return False, 0.0, reasons
+
+    title_required_hits = [contains_term(title_n, term) for term in title_required_terms]
+    title_or_hit = any(contains_term(title_n, term) for term in title_or_terms) if title_or_terms else False
+    desc_required_hits = [contains_term(desc_n, term) for term in desc_required_terms]
+    desc_or_hit = any(contains_term(desc_n, term) for term in desc_or_terms) if desc_or_terms else False
+
+    total_weight = 0.0
+    matched_weight = 0.0
+    if title_required_terms:
+        total_weight += 22.0 * len(title_required_terms)
+        matched_weight += 22.0 * sum(1 for hit in title_required_hits if hit)
+    if title_or_terms:
+        total_weight += 16.0
+        if title_or_hit:
+            matched_weight += 16.0
+    if desc_required_terms:
+        total_weight += 12.0 * len(desc_required_terms)
+        matched_weight += 12.0 * sum(1 for hit in desc_required_hits if hit)
+    if desc_or_terms:
+        total_weight += 10.0
+        if desc_or_hit:
+            matched_weight += 10.0
+
+    if total_weight == 0:
+        return True, 100.0, []
+
+    score = round((matched_weight / total_weight) * 100.0, 1)
+    min_score = clamp_score(get_rule_value(rule, "smart_min_score", 65), 65.0)
+    if score >= min_score:
+        return True, score, []
+
+    reasons.append(f"score:{score}<{min_score}")
+    for term, hit in zip(title_required_terms, title_required_hits):
+        if not hit:
+            reasons.append(f"title:{term}")
+    if title_or_terms and not title_or_hit:
+        reasons.append(f"title_or:{'|'.join(title_or_terms)}")
+    for term, hit in zip(desc_required_terms, desc_required_hits):
+        if not hit:
+            reasons.append(f"description:{term}")
+    if desc_or_terms and not desc_or_hit:
+        reasons.append(f"description_or:{'|'.join(desc_or_terms)}")
+
+    return False, score, reasons
+
+
+def evaluate_rule_match(rule: sqlite3.Row, title: str, description: str) -> tuple[bool, list[str], Optional[float], str]:
+    mode = normalize_text(str(get_rule_value(rule, "match_mode", "smart")))
+    if mode == "smart":
+        ok, score, reasons = rule_match_smart_details(rule, title, description)
+        return ok, reasons, score, "smart"
+
+    ok, reasons = rule_match_details(rule, title, description)
+    return ok, reasons, None, "strict"
+
+
 def rule_matches(rule: sqlite3.Row, title: str, description: str) -> bool:
-    ok, _ = rule_match_details(rule, title, description)
+    ok, _, _, _ = evaluate_rule_match(rule, title, description)
     return ok
 
 
@@ -473,7 +598,11 @@ def log_notification(watch_id: int, item_id: str, title: str, price: Optional[fl
 # MONITOR LOOP
 # ============================================================
 def process_rule(rule: sqlite3.Row):
-    logging.info("Procesando búsqueda %s", rule["name"])
+    active_mode = normalize_text(str(get_rule_value(rule, "match_mode", "smart")))
+    if active_mode not in {"strict", "smart"}:
+        active_mode = "smart"
+    logging.info("Procesando búsqueda %s (modo=%s)", rule["name"], active_mode)
+
     try:
         search_results = fetch_search_results(rule)
     except Exception as exc:
@@ -510,19 +639,15 @@ def process_rule(rule: sqlite3.Row):
             continue
 
         description = str(item.get("description") or "").strip()
-        description_required_terms = split_csv(rule["description_must_include"])
-        try:
-            description_optional_terms = split_csv(rule["description_must_include_or"])
-        except Exception:
-            description_optional_terms = []
-
+        description_required_terms = split_csv(get_rule_value(rule, "description_must_include", ""))
+        description_optional_terms = split_csv(get_rule_value(rule, "description_must_include_or", ""))
         if (description_required_terms or description_optional_terms) and not description:
             try:
                 description = fetch_item_description(url)
             except Exception:
                 description = ""
 
-        matched, reasons = rule_match_details(rule, title, description)
+        matched, reasons, match_score, mode_used = evaluate_rule_match(rule, title, description)
         if not matched:
             stats["criteria_filtered"] += 1
             for reason in reasons:
@@ -530,13 +655,18 @@ def process_rule(rule: sqlite3.Row):
             mark_seen(rule["id"], item_id, title, price, url)
             continue
 
-        message = (
-            f"🟢 Chollo detectado\n"
-            f"Regla: {rule['name']}\n"
-            f"Título: {title}\n"
-            f"Precio: {price if price is not None else 'No detectado'} €\n"
-            f"URL: {url}"
-        )
+        message_lines = [
+            "🟢 Chollo detectado",
+            f"Regla: {rule['name']}",
+            f"Título: {title}",
+            f"Precio: {price if price is not None else 'No detectado'} €",
+            f"Modo: {'inteligente' if mode_used == 'smart' else 'estricto'}",
+        ]
+        if match_score is not None:
+            message_lines.append(f"Score: {match_score}%")
+        message_lines.append(f"URL: {url}")
+
+        message = "\n".join(message_lines)
         ok, status = send_telegram(message)
         log_notification(rule["id"], item_id, title, price, url, status if ok else f"ERROR: {status}")
         mark_seen(rule["id"], item_id, title, price, url)
@@ -641,7 +771,7 @@ BASE_HTML = """
   <style>
     body { font-family: Arial, sans-serif; max-width: 1100px; margin: 30px auto; padding: 0 16px; }
     .card { border: 1px solid #ddd; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
-    input, textarea { width: 100%; padding: 10px; margin-top: 6px; margin-bottom: 12px; box-sizing: border-box; }
+    input, textarea, select { width: 100%; padding: 10px; margin-top: 6px; margin-bottom: 12px; box-sizing: border-box; }
     table { width: 100%; border-collapse: collapse; }
     th, td { border-bottom: 1px solid #eee; padding: 10px; text-align: left; vertical-align: top; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
@@ -707,6 +837,20 @@ BASE_HTML = """
 
       <div class="row">
         <div>
+          <label>Modo de coincidencia</label>
+          <select name="match_mode">
+            <option value="strict">Estricto (todo debe encajar)</option>
+            <option value="smart" selected>Inteligente (score flexible)</option>
+          </select>
+        </div>
+        <div>
+          <label>Score mínimo (modo inteligente, 0-100)</label>
+          <input name="smart_min_score" type="number" min="0" max="100" step="1" placeholder="65">
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
           <label>Palabras que deben aparecer en el título (separadas por comas)</label>
           <input name="title_must_include" placeholder="ps4, 1tb">
         </div>
@@ -759,6 +903,7 @@ BASE_HTML = """
           <td>{{ r['keywords'] }}</td>
           <td>{{ r['min_price'] if r['min_price'] is not none else '-' }} - {{ r['max_price'] if r['max_price'] is not none else '-' }}</td>
           <td>
+            <div><strong>Modo:</strong> {{ 'Inteligente' if (r['match_mode'] or 'smart') == 'smart' else 'Estricto' }}{% if (r['match_mode'] or 'smart') == 'smart' %} (>= {{ r['smart_min_score'] if r['smart_min_score'] is not none else 65 }}%){% endif %}</div>
             <div><strong>Título:</strong> {{ r['title_must_include'] or '-' }}</div>
             <div><strong>Título (O):</strong> {{ r['title_must_include_or'] or '-' }}</div>
             <div><strong>No título:</strong> {{ r['title_must_not_include'] or '-' }}</div>
@@ -861,6 +1006,8 @@ def create_rule():
     keywords = request.form.get("keywords", "").strip()
     min_price = request.form.get("min_price", "").strip()
     max_price = request.form.get("max_price", "").strip()
+    match_mode = normalize_text(request.form.get("match_mode", "smart").strip())
+    smart_min_score_raw = request.form.get("smart_min_score", "").strip()
     title_must_include = request.form.get("title_must_include", "").strip()
     title_must_include_or = request.form.get("title_must_include_or", "").strip()
     title_must_not_include = request.form.get("title_must_not_include", "").strip()
@@ -872,21 +1019,28 @@ def create_rule():
         flash("Nombre y keywords son obligatorios")
         return redirect(url_for("index"))
 
+    if match_mode not in {"strict", "smart"}:
+        match_mode = "smart"
+    smart_min_score = clamp_score(smart_min_score_raw if smart_min_score_raw else 65, 65.0)
+
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(
             """
             INSERT INTO watch_rules (
                 name, keywords, min_price, max_price,
+                match_mode, smart_min_score,
                 title_must_include, title_must_include_or, title_must_not_include,
                 description_must_include, description_must_include_or, must_not_include, is_active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             """,
             (
                 name,
                 keywords,
                 float(min_price) if min_price else None,
                 float(max_price) if max_price else None,
+                match_mode,
+                smart_min_score,
                 title_must_include or None,
                 title_must_include_or or None,
                 title_must_not_include or None,
