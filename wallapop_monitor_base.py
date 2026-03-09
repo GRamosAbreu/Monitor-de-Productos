@@ -1,4 +1,4 @@
-﻿import os
+import os
 import re
 import time
 import uuid
@@ -81,6 +81,11 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = False
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
+_CATEGORY_CACHE_TTL_SECONDS = 60 * 60 * 12
+_category_cache_lock = threading.Lock()
+_category_cache_expires_at = 0.0
+_category_cache_data: list[dict[str, Any]] = []
+
 
 # ============================================================
 # DB
@@ -105,6 +110,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 keywords TEXT NOT NULL,
+                category_id INTEGER,
                 min_price REAL,
                 max_price REAL,
                 title_must_include TEXT,
@@ -126,6 +132,8 @@ def init_db():
             cur.execute("ALTER TABLE watch_rules ADD COLUMN title_must_not_include TEXT")
         if "description_must_include_or" not in watch_rules_columns:
             cur.execute("ALTER TABLE watch_rules ADD COLUMN description_must_include_or TEXT")
+        if "category_id" not in watch_rules_columns:
+            cur.execute("ALTER TABLE watch_rules ADD COLUMN category_id INTEGER")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS seen_items (
@@ -264,6 +272,81 @@ def build_wallapop_api_headers(referer_url: str) -> dict[str, str]:
     }
 
 
+def flatten_categories(categories: Any, parent_path: str = "") -> list[dict[str, Any]]:
+    flattened: list[dict[str, Any]] = []
+    if not isinstance(categories, list):
+        return flattened
+
+    for node in categories:
+        if not isinstance(node, dict):
+            continue
+
+        name = str(node.get("name") or "").strip()
+        if not name:
+            continue
+
+        full_label = f"{parent_path} > {name}" if parent_path else name
+        try:
+            category_id = int(node.get("id"))
+        except Exception:
+            category_id = None
+
+        if category_id is not None:
+            flattened.append({"id": category_id, "label": full_label})
+
+        flattened.extend(flatten_categories(node.get("subcategories", []), full_label))
+
+    return flattened
+
+
+def load_wallapop_categories(force_refresh: bool = False) -> list[dict[str, Any]]:
+    global _category_cache_data, _category_cache_expires_at
+
+    now_ts = time.time()
+    with _category_cache_lock:
+        if (not force_refresh) and _category_cache_data and now_ts < _category_cache_expires_at:
+            return list(_category_cache_data)
+
+    loaded_categories: list[dict[str, Any]] = []
+    try:
+        response = requests.get(
+            "https://api.wallapop.com/api/v3/categories",
+            headers={
+                **HEADERS,
+                "Accept": "application/json, text/plain, */*",
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        loaded_categories = flatten_categories(payload.get("categories", []))
+
+        deduped: list[dict[str, Any]] = []
+        seen_ids: set[int] = set()
+        for category in loaded_categories:
+            category_id = category.get("id")
+            if not isinstance(category_id, int):
+                continue
+            if category_id in seen_ids:
+                continue
+            seen_ids.add(category_id)
+            deduped.append(category)
+
+        loaded_categories = sorted(deduped, key=lambda c: normalize_text(str(c.get("label", ""))))
+    except Exception as exc:
+        logging.exception("No se pudieron cargar las categorías de Wallapop: %s", exc)
+
+    with _category_cache_lock:
+        if loaded_categories:
+            _category_cache_data = loaded_categories
+            _category_cache_expires_at = now_ts + _CATEGORY_CACHE_TTL_SECONDS
+        elif not _category_cache_data:
+            _category_cache_data = []
+            _category_cache_expires_at = now_ts + 300
+
+        return list(_category_cache_data)
+
+
 def extract_price_amount(item: dict[str, Any]) -> Optional[float]:
     price_data = item.get("price")
     if isinstance(price_data, dict):
@@ -273,6 +356,28 @@ def extract_price_amount(item: dict[str, Any]) -> Optional[float]:
     if isinstance(price_data, (int, float)):
         return float(price_data)
     return None
+
+
+def extract_taxonomy_ids(item: dict[str, Any]) -> list[int]:
+    ids: list[int] = []
+
+    def add_candidate(value: Any):
+        try:
+            parsed = int(value)
+        except Exception:
+            return
+        if parsed not in ids:
+            ids.append(parsed)
+
+    add_candidate(item.get("category_id"))
+
+    taxonomy = item.get("taxonomy")
+    if isinstance(taxonomy, list):
+        for node in taxonomy:
+            if isinstance(node, dict):
+                add_candidate(node.get("id"))
+
+    return ids
 
 
 def is_created_today_utc(created_at_ms: Any) -> bool:
@@ -309,6 +414,8 @@ def fetch_search_results_legacy_html(search_url: str) -> list[dict]:
                 "price": price,
                 "url": full_url,
                 "created_at": None,
+                "category_id": None,
+                "taxonomy_ids": [],
             }
         )
     return items
@@ -347,6 +454,7 @@ def fetch_search_results(rule: sqlite3.Row) -> list[dict]:
             created_at = raw.get("created_at")
             if FILTER_TODAY_ONLY and not is_created_today_utc(created_at):
                 continue
+            taxonomy_ids = extract_taxonomy_ids(raw)
 
             item_id = str(raw.get("id") or "").strip()
             web_slug = str(raw.get("web_slug") or "").strip()
@@ -364,6 +472,8 @@ def fetch_search_results(rule: sqlite3.Row) -> list[dict]:
                     "price": extract_price_amount(raw),
                     "url": item_url,
                     "created_at": created_at,
+                    "category_id": raw.get("category_id"),
+                    "taxonomy_ids": taxonomy_ids,
                 }
             )
 
@@ -480,10 +590,16 @@ def process_rule(rule: sqlite3.Row):
         logging.exception("Error cargando búsqueda %s: %s", rule["name"], exc)
         return
 
+    try:
+        rule_category_id = int(rule["category_id"]) if rule["category_id"] is not None else None
+    except Exception:
+        rule_category_id = None
+
     stats = {
         "total": len(search_results),
         "already_seen": 0,
         "price_filtered": 0,
+        "category_filtered": 0,
         "criteria_filtered": 0,
         "sent": 0,
     }
@@ -495,8 +611,22 @@ def process_rule(rule: sqlite3.Row):
         price = item["price"]
         url = item["url"]
 
+        item_category_ids: set[int] = set()
+        for raw_category in item.get("taxonomy_ids", []):
+            try:
+                item_category_ids.add(int(raw_category))
+            except Exception:
+                continue
+
         if already_seen(rule["id"], item_id):
             stats["already_seen"] += 1
+            continue
+
+        if rule_category_id is not None and rule_category_id not in item_category_ids:
+            stats["category_filtered"] += 1
+            stats["criteria_filtered"] += 1
+            criteria_reasons[f"category:{rule_category_id}"] += 1
+            mark_seen(rule["id"], item_id, title, price, url)
             continue
 
         if rule["max_price"] is not None and price is not None and price > rule["max_price"]:
@@ -548,11 +678,12 @@ def process_rule(rule: sqlite3.Row):
     else:
         top_reasons = "-"
     logging.info(
-        "Resumen regla %s -> total=%s | vistos=%s | precio=%s | criterio=%s | enviados=%s | top_descartes=%s",
+        "Resumen regla %s -> total=%s | vistos=%s | precio=%s | categoria=%s | criterio=%s | enviados=%s | top_descartes=%s",
         rule["name"],
         stats["total"],
         stats["already_seen"],
         stats["price_filtered"],
+        stats["category_filtered"],
         stats["criteria_filtered"],
         stats["sent"],
         top_reasons,
@@ -627,6 +758,8 @@ LOGIN_HTML = """
       <button class="btn" type="submit">Entrar</button>
     </form>
   </div>
+
+
 </body>
 </html>
 """
@@ -641,7 +774,7 @@ BASE_HTML = """
   <style>
     body { font-family: Arial, sans-serif; max-width: 1100px; margin: 30px auto; padding: 0 16px; }
     .card { border: 1px solid #ddd; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
-    input, textarea { width: 100%; padding: 10px; margin-top: 6px; margin-bottom: 12px; box-sizing: border-box; }
+    input, textarea, select { width: 100%; padding: 10px; margin-top: 6px; margin-bottom: 12px; box-sizing: border-box; }
     table { width: 100%; border-collapse: collapse; }
     th, td { border-bottom: 1px solid #eee; padding: 10px; text-align: left; vertical-align: top; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
@@ -693,6 +826,15 @@ BASE_HTML = """
           <input name="keywords" placeholder="ps4" required>
         </div>
       </div>
+
+      <label>Categoría (opcional)</label>
+      <input id="create-category-search" type="text" placeholder="Buscar categoría (ej: consolas)">
+      <select id="create-category-id" name="category_id">
+        <option value="">Todas las categorías</option>
+        {% for c in categories %}
+          <option value="{{ c['id'] }}">{{ c['label'] }}</option>
+        {% endfor %}
+      </select>
 
       <div class="row">
         <div>
@@ -759,6 +901,7 @@ BASE_HTML = """
           <td>{{ r['keywords'] }}</td>
           <td>{{ r['min_price'] if r['min_price'] is not none else '-' }} - {{ r['max_price'] if r['max_price'] is not none else '-' }}</td>
           <td>
+            <div><strong>Categoría:</strong> {{ r['category_label'] or '-' }}</div>
             <div><strong>Título:</strong> {{ r['title_must_include'] or '-' }}</div>
             <div><strong>Título (O):</strong> {{ r['title_must_include_or'] or '-' }}</div>
             <div><strong>No título:</strong> {{ r['title_must_not_include'] or '-' }}</div>
@@ -768,6 +911,7 @@ BASE_HTML = """
           </td>
           <td>{{ 'Activa' if r['is_active'] else 'Pausada' }}</td>
           <td>
+            <a class="btn btn-secondary" href="/edit/{{ r['id'] }}">Editar</a>
             <a class="btn btn-secondary" href="/toggle/{{ r['id'] }}">Activar/Pausar</a>
             <a class="btn btn-danger" href="/delete/{{ r['id'] }}" onclick="return confirm('¿Eliminar esta regla?')">Eliminar</a>
           </td>
@@ -804,10 +948,191 @@ BASE_HTML = """
       </tbody>
     </table>
   </div>
+
+  <script>
+    function wireCategorySearch(searchId, selectId) {
+      const searchInput = document.getElementById(searchId);
+      const select = document.getElementById(selectId);
+      if (!searchInput || !select) {
+        return;
+      }
+
+      const allOptions = Array.from(select.options).map((opt) => ({
+        value: opt.value,
+        label: opt.textContent,
+      }));
+
+      function rebuildOptions(query) {
+        const selectedValue = select.value;
+        const q = (query || '').toLowerCase().trim();
+
+        select.innerHTML = '';
+        allOptions.forEach((option, index) => {
+          if (index === 0 || !q || option.label.toLowerCase().includes(q)) {
+            const el = document.createElement('option');
+            el.value = option.value;
+            el.textContent = option.label;
+            if (option.value === selectedValue) {
+              el.selected = true;
+            }
+            select.appendChild(el);
+          }
+        });
+
+        if (!Array.from(select.options).some((opt) => opt.selected)) {
+          select.selectedIndex = 0;
+        }
+      }
+
+      searchInput.addEventListener('input', () => rebuildOptions(searchInput.value));
+    }
+
+    wireCategorySearch('create-category-search', 'create-category-id');
+  </script>
 </body>
 </html>
 """
 
+EDIT_RULE_HTML = """
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Editar regla - Monitor Wallapop</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 900px; margin: 30px auto; padding: 0 16px; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+    input, textarea, select { width: 100%; padding: 10px; margin-top: 6px; margin-bottom: 12px; box-sizing: border-box; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .btn { display: inline-block; padding: 10px 14px; background: black; color: white; text-decoration: none; border-radius: 8px; border: 0; cursor: pointer; }
+    .btn-secondary { background: #555; }
+    .flash { padding: 10px; background: #f2f2f2; border-radius: 8px; margin-bottom: 12px; }
+    @media (max-width: 700px) {
+      .row { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1 style="margin-top:0;">Editar regla #{{ rule['id'] }}</h1>
+
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        {% for message in messages %}
+          <div class="flash">{{ message }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <form method="post" action="/edit/{{ rule['id'] }}">
+      <div class="row">
+        <div>
+          <label>Nombre interno</label>
+          <input name="name" value="{{ rule['name'] or '' }}" required>
+        </div>
+        <div>
+          <label>Keywords de búsqueda</label>
+          <input name="keywords" value="{{ rule['keywords'] or '' }}" required>
+        </div>
+      </div>
+
+      <label>Categoría (opcional)</label>
+      <input id="edit-category-search" type="text" placeholder="Buscar categoría (ej: consolas)">
+      <select id="edit-category-id" name="category_id">
+        <option value="" {% if selected_category_id is none %}selected{% endif %}>Todas las categorías</option>
+        {% for c in categories %}
+          <option value="{{ c['id'] }}" {% if selected_category_id == c['id'] %}selected{% endif %}>{{ c['label'] }}</option>
+        {% endfor %}
+      </select>
+
+      <div class="row">
+        <div>
+          <label>Precio mínimo</label>
+          <input name="min_price" type="number" step="0.01" value="{{ '' if rule['min_price'] is none else rule['min_price'] }}">
+        </div>
+        <div>
+          <label>Precio máximo</label>
+          <input name="max_price" type="number" step="0.01" value="{{ '' if rule['max_price'] is none else rule['max_price'] }}">
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>Palabras que deben aparecer en el título (separadas por comas)</label>
+          <input name="title_must_include" value="{{ rule['title_must_include'] or '' }}">
+        </div>
+        <div>
+          <label>O (alternativas en título, separadas por comas)</label>
+          <input name="title_must_include_or" value="{{ rule['title_must_include_or'] or '' }}">
+        </div>
+      </div>
+
+      <label>Palabras que NO deben aparecer en el título (separadas por comas)</label>
+      <input name="title_must_not_include" value="{{ rule['title_must_not_include'] or '' }}">
+
+      <div class="row">
+        <div>
+          <label>Palabras que deben aparecer en la descripción (separadas por comas)</label>
+          <input name="description_must_include" value="{{ rule['description_must_include'] or '' }}">
+        </div>
+        <div>
+          <label>O (alternativas en descripción, separadas por comas)</label>
+          <input name="description_must_include_or" value="{{ rule['description_must_include_or'] or '' }}">
+        </div>
+      </div>
+
+      <label>Palabras a excluir (separadas por comas)</label>
+      <input name="must_not_include" value="{{ rule['must_not_include'] or '' }}">
+
+      <button class="btn" type="submit">Guardar cambios</button>
+      <a class="btn btn-secondary" href="/">Volver</a>
+    </form>
+  </div>
+
+  <script>
+    function wireCategorySearch(searchId, selectId) {
+      const searchInput = document.getElementById(searchId);
+      const select = document.getElementById(selectId);
+      if (!searchInput || !select) {
+        return;
+      }
+
+      const allOptions = Array.from(select.options).map((opt) => ({
+        value: opt.value,
+        label: opt.textContent,
+      }));
+
+      function rebuildOptions(query) {
+        const selectedValue = select.value;
+        const q = (query || '').toLowerCase().trim();
+
+        select.innerHTML = '';
+        allOptions.forEach((option, index) => {
+          if (index === 0 || !q || option.label.toLowerCase().includes(q)) {
+            const el = document.createElement('option');
+            el.value = option.value;
+            el.textContent = option.label;
+            if (option.value === selectedValue) {
+              el.selected = true;
+            }
+            select.appendChild(el);
+          }
+        });
+
+        if (!Array.from(select.options).some((opt) => opt.selected)) {
+          select.selectedIndex = 0;
+        }
+      }
+
+      searchInput.addEventListener('input', () => rebuildOptions(searchInput.value));
+    }
+
+    wireCategorySearch('edit-category-search', 'edit-category-id');
+  </script>
+</body>
+</html>
+"""
 
 @app.before_request
 def _startup():
@@ -837,10 +1162,24 @@ def logout():
 @app.route("/")
 @login_required
 def index():
+    categories = load_wallapop_categories()
+    category_map = {int(c["id"]): c["label"] for c in categories if isinstance(c.get("id"), int)}
+
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT * FROM watch_rules ORDER BY id DESC")
-        rules = cur.fetchall()
+        raw_rules = cur.fetchall()
+
+        rules: list[dict[str, Any]] = []
+        for row in raw_rules:
+            rule = dict(row)
+            try:
+                selected_category_id = int(rule.get("category_id")) if rule.get("category_id") is not None else None
+            except Exception:
+                selected_category_id = None
+            rule["category_label"] = category_map.get(selected_category_id, "-") if selected_category_id is not None else "-"
+            rules.append(rule)
+
         cur.execute(
             """
             SELECT n.*, w.name AS watch_name
@@ -851,7 +1190,8 @@ def index():
             """
         )
         notifications = cur.fetchall()
-    return render_template_string(BASE_HTML, rules=rules, notifications=notifications)
+
+    return render_template_string(BASE_HTML, rules=rules, notifications=notifications, categories=categories)
 
 
 @app.route("/create", methods=["POST"])
@@ -859,6 +1199,7 @@ def index():
 def create_rule():
     name = request.form.get("name", "").strip()
     keywords = request.form.get("keywords", "").strip()
+    category_id_raw = request.form.get("category_id", "").strip()
     min_price = request.form.get("min_price", "").strip()
     max_price = request.form.get("max_price", "").strip()
     title_must_include = request.form.get("title_must_include", "").strip()
@@ -872,19 +1213,28 @@ def create_rule():
         flash("Nombre y keywords son obligatorios")
         return redirect(url_for("index"))
 
+    category_id: Optional[int] = None
+    if category_id_raw:
+        try:
+            category_id = int(category_id_raw)
+        except ValueError:
+            flash("Categoría no válida")
+            return redirect(url_for("index"))
+
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(
             """
             INSERT INTO watch_rules (
-                name, keywords, min_price, max_price,
+                name, keywords, category_id, min_price, max_price,
                 title_must_include, title_must_include_or, title_must_not_include,
                 description_must_include, description_must_include_or, must_not_include, is_active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             """,
             (
                 name,
                 keywords,
+                category_id,
                 float(min_price) if min_price else None,
                 float(max_price) if max_price else None,
                 title_must_include or None,
@@ -899,6 +1249,96 @@ def create_rule():
     flash("Regla creada correctamente")
     return redirect(url_for("index"))
 
+
+@app.route("/edit/<int:rule_id>", methods=["GET", "POST"])
+@login_required
+def edit_rule(rule_id: int):
+    categories = load_wallapop_categories()
+
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM watch_rules WHERE id = ?", (rule_id,))
+        row = cur.fetchone()
+
+    if row is None:
+        flash("Regla no encontrada")
+        return redirect(url_for("index"))
+
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        keywords = request.form.get("keywords", "").strip()
+        category_id_raw = request.form.get("category_id", "").strip()
+        min_price = request.form.get("min_price", "").strip()
+        max_price = request.form.get("max_price", "").strip()
+        title_must_include = request.form.get("title_must_include", "").strip()
+        title_must_include_or = request.form.get("title_must_include_or", "").strip()
+        title_must_not_include = request.form.get("title_must_not_include", "").strip()
+        description_must_include = request.form.get("description_must_include", "").strip()
+        description_must_include_or = request.form.get("description_must_include_or", "").strip()
+        must_not_include = request.form.get("must_not_include", "").strip()
+
+        if not name or not keywords:
+            flash("Nombre y keywords son obligatorios")
+            return redirect(url_for("edit_rule", rule_id=rule_id))
+
+        category_id: Optional[int] = None
+        if category_id_raw:
+            try:
+                category_id = int(category_id_raw)
+            except ValueError:
+                flash("Categoría no válida")
+                return redirect(url_for("edit_rule", rule_id=rule_id))
+
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE watch_rules
+                SET
+                    name = ?,
+                    keywords = ?,
+                    category_id = ?,
+                    min_price = ?,
+                    max_price = ?,
+                    title_must_include = ?,
+                    title_must_include_or = ?,
+                    title_must_not_include = ?,
+                    description_must_include = ?,
+                    description_must_include_or = ?,
+                    must_not_include = ?
+                WHERE id = ?
+                """,
+                (
+                    name,
+                    keywords,
+                    category_id,
+                    float(min_price) if min_price else None,
+                    float(max_price) if max_price else None,
+                    title_must_include or None,
+                    title_must_include_or or None,
+                    title_must_not_include or None,
+                    description_must_include or None,
+                    description_must_include_or or None,
+                    must_not_include or None,
+                    rule_id,
+                ),
+            )
+
+        flash("Regla actualizada correctamente")
+        return redirect(url_for("index"))
+
+    rule = dict(row)
+    try:
+        selected_category_id = int(rule.get("category_id")) if rule.get("category_id") is not None else None
+    except Exception:
+        selected_category_id = None
+
+    return render_template_string(
+        EDIT_RULE_HTML,
+        rule=rule,
+        categories=categories,
+        selected_category_id=selected_category_id,
+    )
 
 @app.route("/toggle/<int:rule_id>")
 @login_required
