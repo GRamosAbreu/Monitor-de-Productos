@@ -115,6 +115,7 @@ def init_db():
                 max_price REAL,
                 title_must_include TEXT,
                 title_must_include_or TEXT,
+                title_starts_with_any TEXT,
                 title_must_not_include TEXT,
                 description_must_include TEXT,
                 description_must_include_or TEXT,
@@ -128,6 +129,8 @@ def init_db():
         watch_rules_columns = {row[1] for row in cur.fetchall()}
         if "title_must_include_or" not in watch_rules_columns:
             cur.execute("ALTER TABLE watch_rules ADD COLUMN title_must_include_or TEXT")
+        if "title_starts_with_any" not in watch_rules_columns:
+            cur.execute("ALTER TABLE watch_rules ADD COLUMN title_starts_with_any TEXT")
         if "title_must_not_include" not in watch_rules_columns:
             cur.execute("ALTER TABLE watch_rules ADD COLUMN title_must_not_include TEXT")
         if "description_must_include_or" not in watch_rules_columns:
@@ -167,6 +170,18 @@ def split_csv(text: Optional[str]) -> list[str]:
     if not text:
         return []
     return [x.strip() for x in text.split(",") if x.strip()]
+
+
+def first_word(text: Optional[str]) -> str:
+    normalized = normalize_text(text)
+    if not normalized:
+        return ""
+
+    for token in re.split(r"\s+", normalized):
+        cleaned = re.sub(r"^\W+|\W+$", "", token)
+        if cleaned:
+            return cleaned
+    return ""
 
 
 # ============================================================
@@ -513,6 +528,18 @@ def rule_match_details(rule: sqlite3.Row, title: str, description: str) -> tuple
             if include_or_terms:
                 reasons.append(f"title_or:{'|'.join(include_or_terms)}")
 
+    try:
+        starts_with_raw = rule["title_starts_with_any"]
+    except Exception:
+        starts_with_raw = None
+    starts_with_terms = split_csv(starts_with_raw)
+    if starts_with_terms:
+        title_first = first_word(title_n)
+        allowed_first_words = [first_word(term) for term in starts_with_terms]
+        allowed_first_words = [word for word in allowed_first_words if word]
+        if allowed_first_words and title_first not in allowed_first_words:
+            reasons.append(f"title_starts_with:{'|'.join(allowed_first_words)}")
+
     for term in split_csv(rule["title_must_not_include"]):
         if contains_term(title_n, term):
             reasons.append(f"title_excluded:{term}")
@@ -858,6 +885,9 @@ BASE_HTML = """
         </div>
       </div>
 
+      <label>Palabras con las que debe comenzar el titulo (separadas por comas)</label>
+      <input name="title_starts_with_any" placeholder="ps4, playstation, consola">
+
       <label>Palabras que NO deben aparecer en el título (separadas por comas)</label>
       <input name="title_must_not_include" placeholder="edición digital, averiada, sin lector">
 
@@ -904,6 +934,7 @@ BASE_HTML = """
             <div><strong>Categoría:</strong> {{ r['category_label'] or '-' }}</div>
             <div><strong>Título:</strong> {{ r['title_must_include'] or '-' }}</div>
             <div><strong>Título (O):</strong> {{ r['title_must_include_or'] or '-' }}</div>
+            <div><strong>Inicio titulo:</strong> {{ r['title_starts_with_any'] or '-' }}</div>
             <div><strong>No título:</strong> {{ r['title_must_not_include'] or '-' }}</div>
             <div><strong>Desc:</strong> {{ r['description_must_include'] or '-' }}</div>
             <div><strong>Desc (O):</strong> {{ r['description_must_include_or'] or '-' }}</div>
@@ -1068,6 +1099,9 @@ EDIT_RULE_HTML = """
         </div>
       </div>
 
+      <label>Palabras con las que debe comenzar el titulo (separadas por comas)</label>
+      <input name="title_starts_with_any" value="{{ rule['title_starts_with_any'] or '' }}">
+
       <label>Palabras que NO deben aparecer en el título (separadas por comas)</label>
       <input name="title_must_not_include" value="{{ rule['title_must_not_include'] or '' }}">
 
@@ -1204,6 +1238,7 @@ def create_rule():
     max_price = request.form.get("max_price", "").strip()
     title_must_include = request.form.get("title_must_include", "").strip()
     title_must_include_or = request.form.get("title_must_include_or", "").strip()
+    title_starts_with_any = request.form.get("title_starts_with_any", "").strip()
     title_must_not_include = request.form.get("title_must_not_include", "").strip()
     description_must_include = request.form.get("description_must_include", "").strip()
     description_must_include_or = request.form.get("description_must_include_or", "").strip()
@@ -1227,9 +1262,9 @@ def create_rule():
             """
             INSERT INTO watch_rules (
                 name, keywords, category_id, min_price, max_price,
-                title_must_include, title_must_include_or, title_must_not_include,
+                title_must_include, title_must_include_or, title_starts_with_any, title_must_not_include,
                 description_must_include, description_must_include_or, must_not_include, is_active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             """,
             (
                 name,
@@ -1239,6 +1274,7 @@ def create_rule():
                 float(max_price) if max_price else None,
                 title_must_include or None,
                 title_must_include_or or None,
+                title_starts_with_any or None,
                 title_must_not_include or None,
                 description_must_include or None,
                 description_must_include_or or None,
@@ -1272,6 +1308,7 @@ def edit_rule(rule_id: int):
         max_price = request.form.get("max_price", "").strip()
         title_must_include = request.form.get("title_must_include", "").strip()
         title_must_include_or = request.form.get("title_must_include_or", "").strip()
+        title_starts_with_any = request.form.get("title_starts_with_any", "").strip()
         title_must_not_include = request.form.get("title_must_not_include", "").strip()
         description_must_include = request.form.get("description_must_include", "").strip()
         description_must_include_or = request.form.get("description_must_include_or", "").strip()
@@ -1302,6 +1339,7 @@ def edit_rule(rule_id: int):
                     max_price = ?,
                     title_must_include = ?,
                     title_must_include_or = ?,
+                    title_starts_with_any = ?,
                     title_must_not_include = ?,
                     description_must_include = ?,
                     description_must_include_or = ?,
@@ -1316,6 +1354,7 @@ def edit_rule(rule_id: int):
                     float(max_price) if max_price else None,
                     title_must_include or None,
                     title_must_include_or or None,
+                    title_starts_with_any or None,
                     title_must_not_include or None,
                     description_must_include or None,
                     description_must_include_or or None,
