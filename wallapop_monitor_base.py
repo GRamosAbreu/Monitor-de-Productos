@@ -119,6 +119,7 @@ def init_db():
                 title_must_not_include TEXT,
                 description_must_include TEXT,
                 description_must_include_or TEXT,
+                description_must_not_include TEXT,
                 must_not_include TEXT,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -135,6 +136,8 @@ def init_db():
             cur.execute("ALTER TABLE watch_rules ADD COLUMN title_must_not_include TEXT")
         if "description_must_include_or" not in watch_rules_columns:
             cur.execute("ALTER TABLE watch_rules ADD COLUMN description_must_include_or TEXT")
+        if "description_must_not_include" not in watch_rules_columns:
+            cur.execute("ALTER TABLE watch_rules ADD COLUMN description_must_not_include TEXT")
         if "category_id" not in watch_rules_columns:
             cur.execute("ALTER TABLE watch_rules ADD COLUMN category_id INTEGER")
         cur.execute(
@@ -220,6 +223,10 @@ def contains_term(text: Optional[str], term: Optional[str]) -> bool:
 
     # Extra tolerance for variants like "1 tb" vs "1tb".
     return compact_text(term_n) in compact_text(text_n)
+
+
+def contains_phrase(text: Optional[str], phrase: Optional[str]) -> bool:
+    return contains_term(text, phrase)
 
 
 def extract_price(text: str) -> Optional[float]:
@@ -541,7 +548,7 @@ def rule_match_details(rule: sqlite3.Row, title: str, description: str) -> tuple
             reasons.append(f"title_starts_with:{'|'.join(allowed_first_words)}")
 
     for term in split_csv(rule["title_must_not_include"]):
-        if contains_term(title_n, term):
+        if contains_phrase(title_n, term):
             reasons.append(f"title_excluded:{term}")
 
     desc_include_terms = split_csv(rule["description_must_include"])
@@ -560,8 +567,12 @@ def rule_match_details(rule: sqlite3.Row, title: str, description: str) -> tuple
             if desc_include_or_terms:
                 reasons.append(f"description_or:{'|'.join(desc_include_or_terms)}")
 
+    for term in split_csv(rule["description_must_not_include"]):
+        if contains_phrase(desc_n, term):
+            reasons.append(f"description_excluded:{term}")
+
     for term in split_csv(rule["must_not_include"]):
-        if contains_term(whole, term):
+        if contains_phrase(whole, term):
             reasons.append(f"excluded:{term}")
 
     return len(reasons) == 0, reasons
@@ -672,8 +683,18 @@ def process_rule(rule: sqlite3.Row):
             description_optional_terms = split_csv(rule["description_must_include_or"])
         except Exception:
             description_optional_terms = []
+        try:
+            description_excluded_terms = split_csv(rule["description_must_not_include"])
+        except Exception:
+            description_excluded_terms = []
+        global_excluded_terms = split_csv(rule["must_not_include"])
 
-        if (description_required_terms or description_optional_terms) and not description:
+        if (
+            description_required_terms
+            or description_optional_terms
+            or description_excluded_terms
+            or global_excluded_terms
+        ) and not description:
             try:
                 description = fetch_item_description(url)
             except Exception:
@@ -888,7 +909,7 @@ BASE_HTML = """
       <label>Palabras con las que debe comenzar el titulo (separadas por comas)</label>
       <input name="title_starts_with_any" placeholder="ps4, playstation, consola">
 
-      <label>Palabras que NO deben aparecer en el título (separadas por comas)</label>
+      <label>Palabras o frases que NO deben aparecer en el título (separadas por comas)</label>
       <input name="title_must_not_include" placeholder="edición digital, averiada, sin lector">
 
       <div class="row">
@@ -902,7 +923,10 @@ BASE_HTML = """
         </div>
       </div>
 
-      <label>Palabras a excluir (separadas por comas)</label>
+      <label>Palabras o frases que NO deben aparecer en la descripción (separadas por comas)</label>
+      <input name="description_must_not_include" placeholder="sin mando, para piezas, con drift">
+
+      <label>Palabras o frases a excluir en general (título o descripción, separadas por comas)</label>
       <input name="must_not_include" placeholder="para piezas, averiada, no funciona, sin mando, solo consola">
 
       <button class="btn" type="submit">Crear regla</button>
@@ -938,7 +962,8 @@ BASE_HTML = """
             <div><strong>No título:</strong> {{ r['title_must_not_include'] or '-' }}</div>
             <div><strong>Desc:</strong> {{ r['description_must_include'] or '-' }}</div>
             <div><strong>Desc (O):</strong> {{ r['description_must_include_or'] or '-' }}</div>
-            <div><strong>Excluir:</strong> {{ r['must_not_include'] or '-' }}</div>
+            <div><strong>No desc:</strong> {{ r['description_must_not_include'] or '-' }}</div>
+            <div><strong>Excluir global:</strong> {{ r['must_not_include'] or '-' }}</div>
           </td>
           <td>{{ 'Activa' if r['is_active'] else 'Pausada' }}</td>
           <td>
@@ -1102,7 +1127,7 @@ EDIT_RULE_HTML = """
       <label>Palabras con las que debe comenzar el titulo (separadas por comas)</label>
       <input name="title_starts_with_any" value="{{ rule['title_starts_with_any'] or '' }}">
 
-      <label>Palabras que NO deben aparecer en el título (separadas por comas)</label>
+      <label>Palabras o frases que NO deben aparecer en el título (separadas por comas)</label>
       <input name="title_must_not_include" value="{{ rule['title_must_not_include'] or '' }}">
 
       <div class="row">
@@ -1116,7 +1141,10 @@ EDIT_RULE_HTML = """
         </div>
       </div>
 
-      <label>Palabras a excluir (separadas por comas)</label>
+      <label>Palabras o frases que NO deben aparecer en la descripción (separadas por comas)</label>
+      <input name="description_must_not_include" value="{{ rule['description_must_not_include'] or '' }}">
+
+      <label>Palabras o frases a excluir en general (título o descripción, separadas por comas)</label>
       <input name="must_not_include" value="{{ rule['must_not_include'] or '' }}">
 
       <button class="btn" type="submit">Guardar cambios</button>
@@ -1242,6 +1270,7 @@ def create_rule():
     title_must_not_include = request.form.get("title_must_not_include", "").strip()
     description_must_include = request.form.get("description_must_include", "").strip()
     description_must_include_or = request.form.get("description_must_include_or", "").strip()
+    description_must_not_include = request.form.get("description_must_not_include", "").strip()
     must_not_include = request.form.get("must_not_include", "").strip()
 
     if not name or not keywords:
@@ -1263,8 +1292,8 @@ def create_rule():
             INSERT INTO watch_rules (
                 name, keywords, category_id, min_price, max_price,
                 title_must_include, title_must_include_or, title_starts_with_any, title_must_not_include,
-                description_must_include, description_must_include_or, must_not_include, is_active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                description_must_include, description_must_include_or, description_must_not_include, must_not_include, is_active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             """,
             (
                 name,
@@ -1278,6 +1307,7 @@ def create_rule():
                 title_must_not_include or None,
                 description_must_include or None,
                 description_must_include_or or None,
+                description_must_not_include or None,
                 must_not_include or None,
             ),
         )
@@ -1312,6 +1342,7 @@ def edit_rule(rule_id: int):
         title_must_not_include = request.form.get("title_must_not_include", "").strip()
         description_must_include = request.form.get("description_must_include", "").strip()
         description_must_include_or = request.form.get("description_must_include_or", "").strip()
+        description_must_not_include = request.form.get("description_must_not_include", "").strip()
         must_not_include = request.form.get("must_not_include", "").strip()
 
         if not name or not keywords:
@@ -1343,6 +1374,7 @@ def edit_rule(rule_id: int):
                     title_must_not_include = ?,
                     description_must_include = ?,
                     description_must_include_or = ?,
+                    description_must_not_include = ?,
                     must_not_include = ?
                 WHERE id = ?
                 """,
@@ -1358,6 +1390,7 @@ def edit_rule(rule_id: int):
                     title_must_not_include or None,
                     description_must_include or None,
                     description_must_include_or or None,
+                    description_must_not_include or None,
                     must_not_include or None,
                     rule_id,
                 ),
