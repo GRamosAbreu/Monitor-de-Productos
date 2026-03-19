@@ -8,7 +8,7 @@ import random
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from collections import Counter
+from collections import Counter, deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from functools import wraps
@@ -77,6 +77,12 @@ RULE_START_STAGGER_MAX_SECONDS = max(
     RULE_START_STAGGER_MIN_SECONDS,
     float(env_str("RULE_START_STAGGER_MAX_SECONDS", "1.10")),
 )
+SCRAPER_HEALTH_ALERTS_ENABLED = env_bool("SCRAPER_HEALTH_ALERTS_ENABLED", True)
+SCRAPER_HEALTH_WINDOW_SECONDS = max(60, int(env_str("SCRAPER_HEALTH_WINDOW_SECONDS", "900")))
+SCRAPER_HEALTH_ALERT_COOLDOWN_SECONDS = max(60, int(env_str("SCRAPER_HEALTH_ALERT_COOLDOWN_SECONDS", "1800")))
+SCRAPER_HEALTH_MIN_SEARCHES = max(3, int(env_str("SCRAPER_HEALTH_MIN_SEARCHES", "6")))
+SCRAPER_HEALTH_MIN_PROBLEMS = max(1, int(env_str("SCRAPER_HEALTH_MIN_PROBLEMS", "3")))
+SCRAPER_HEALTH_PROBLEM_RATIO = min(1.0, max(0.0, float(env_str("SCRAPER_HEALTH_PROBLEM_RATIO", "0.50"))))
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -94,6 +100,9 @@ _CATEGORY_CACHE_TTL_SECONDS = 60 * 60 * 12
 _category_cache_lock = threading.Lock()
 _category_cache_expires_at = 0.0
 _category_cache_data: list[dict[str, Any]] = []
+_scraper_health_lock = threading.Lock()
+_scraper_health_events: deque[dict[str, Any]] = deque()
+_scraper_health_last_alert_at = 0.0
 
 
 # ============================================================
@@ -270,6 +279,112 @@ def send_telegram(message: str) -> tuple[bool, str]:
         return True, "ok"
     except Exception as exc:
         return False, str(exc)
+
+
+def prune_scraper_health_events(now_ts: float):
+    while _scraper_health_events and (now_ts - _scraper_health_events[0]["ts"]) > SCRAPER_HEALTH_WINDOW_SECONDS:
+        _scraper_health_events.popleft()
+
+
+def build_scraper_health_snapshot_from_events(events: list[dict[str, Any]]) -> dict[str, Any]:
+    total_searches = len(events)
+    api_ok = sum(1 for event in events if event["outcome"] == "api_ok")
+    fallback_ok = sum(1 for event in events if event["outcome"] == "fallback_ok")
+    failed = sum(1 for event in events if event["outcome"] == "failed")
+    blocked_http = sum(1 for event in events if event.get("status_code") in {403, 429})
+    problem_count = fallback_ok + failed
+
+    reasons: list[str] = []
+    if blocked_http >= 2:
+        reasons.append(f"bloqueos_http={blocked_http}")
+    if failed >= 2:
+        reasons.append(f"fallos={failed}")
+    if (
+        total_searches >= SCRAPER_HEALTH_MIN_SEARCHES
+        and problem_count >= SCRAPER_HEALTH_MIN_PROBLEMS
+        and (problem_count / total_searches) >= SCRAPER_HEALTH_PROBLEM_RATIO
+    ):
+        reasons.append(f"ratio_problemas={problem_count}/{total_searches}")
+
+    last_event = events[-1] if events else {}
+    return {
+        "window_seconds": SCRAPER_HEALTH_WINDOW_SECONDS,
+        "total_searches": total_searches,
+        "api_ok": api_ok,
+        "fallback_ok": fallback_ok,
+        "failed": failed,
+        "blocked_http": blocked_http,
+        "problem_count": problem_count,
+        "degraded": len(reasons) > 0,
+        "reasons": reasons,
+        "last_rule_name": last_event.get("rule_name"),
+        "last_status_code": last_event.get("status_code"),
+        "last_outcome": last_event.get("outcome"),
+    }
+
+
+def build_scraper_health_snapshot(now_ts: Optional[float] = None) -> dict[str, Any]:
+    current_ts = now_ts if now_ts is not None else time.time()
+    with _scraper_health_lock:
+        prune_scraper_health_events(current_ts)
+        events = list(_scraper_health_events)
+    return build_scraper_health_snapshot_from_events(events)
+
+
+def send_scraper_health_alert(snapshot: dict[str, Any]):
+    message = (
+        "ALERTA: salud del scraper en descenso\n"
+        f"Ventana: {snapshot['window_seconds']}s\n"
+        f"Busquedas: {snapshot['total_searches']}\n"
+        f"API OK: {snapshot['api_ok']}\n"
+        f"Fallback HTML: {snapshot['fallback_ok']}\n"
+        f"Fallidas: {snapshot['failed']}\n"
+        f"HTTP 403/429: {snapshot['blocked_http']}\n"
+        f"Motivos: {', '.join(snapshot['reasons'])}\n"
+        f"Ultima regla: {snapshot['last_rule_name'] or '-'}"
+    )
+    ok, status = send_telegram(message)
+    if ok:
+        logging.warning("Alerta de salud del scraper enviada a Telegram")
+    else:
+        logging.error("No se pudo enviar la alerta de salud del scraper: %s", status)
+
+
+def record_scraper_search_outcome(
+    rule_name: str,
+    outcome: str,
+    *,
+    status_code: Optional[int] = None,
+    result_count: Optional[int] = None,
+    issue_type: str = "",
+):
+    global _scraper_health_last_alert_at
+
+    if not SCRAPER_HEALTH_ALERTS_ENABLED:
+        return
+
+    now_ts = time.time()
+    event = {
+        "ts": now_ts,
+        "rule_name": rule_name,
+        "outcome": outcome,
+        "status_code": status_code,
+        "result_count": result_count,
+        "issue_type": issue_type,
+    }
+
+    should_alert = False
+    snapshot: dict[str, Any] = {}
+    with _scraper_health_lock:
+        _scraper_health_events.append(event)
+        prune_scraper_health_events(now_ts)
+        snapshot = build_scraper_health_snapshot_from_events(list(_scraper_health_events))
+        if snapshot["degraded"] and (now_ts - _scraper_health_last_alert_at) >= SCRAPER_HEALTH_ALERT_COOLDOWN_SECONDS:
+            _scraper_health_last_alert_at = now_ts
+            should_alert = True
+
+    if should_alert:
+        send_scraper_health_alert(snapshot)
 
 
 def build_search_url(rule: sqlite3.Row) -> str:
@@ -452,6 +567,34 @@ def fetch_search_results_legacy_html(search_url: str) -> list[dict]:
     return items
 
 
+def fetch_search_results_with_fallback(
+    rule: sqlite3.Row,
+    search_url: str,
+    *,
+    issue_type: str,
+    status_code: Optional[int] = None,
+) -> list[dict]:
+    try:
+        items = fetch_search_results_legacy_html(search_url)
+        record_scraper_search_outcome(
+            rule["name"],
+            "fallback_ok",
+            status_code=status_code,
+            result_count=len(items),
+            issue_type=issue_type,
+        )
+        logging.info("Fallback HTML: %s resultados para %s", len(items), rule["name"])
+        return items
+    except Exception:
+        record_scraper_search_outcome(
+            rule["name"],
+            "failed",
+            status_code=status_code,
+            issue_type=issue_type,
+        )
+        raise
+
+
 def fetch_search_results(rule: sqlite3.Row) -> list[dict]:
     search_url = build_search_url(rule)
     params: dict[str, Any] = {
@@ -509,10 +652,20 @@ def fetch_search_results(rule: sqlite3.Row) -> list[dict]:
             )
 
         logging.info("Wallapop API: %s resultados para %s", len(items), rule["name"])
+        record_scraper_search_outcome(rule["name"], "api_ok", result_count=len(items))
         return items
+    except requests.exceptions.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        logging.exception("Fallo HTTP en API de Wallapop, usando fallback HTML: %s", exc)
+        return fetch_search_results_with_fallback(
+            rule,
+            search_url,
+            issue_type=f"api_http_{status_code or 'unknown'}",
+            status_code=status_code,
+        )
     except Exception as exc:
         logging.exception("Fallo en API de Wallapop, usando fallback HTML: %s", exc)
-        return fetch_search_results_legacy_html(search_url)
+        return fetch_search_results_with_fallback(rule, search_url, issue_type="api_error")
 
 
 def fetch_item_description(item_url: str) -> str:
@@ -1523,6 +1676,7 @@ def health():
         "poll_seconds": POLL_SECONDS,
         "max_concurrent_rules": MAX_CONCURRENT_RULES,
         "rule_batch_pause_seconds": RULE_BATCH_PAUSE_SECONDS,
+        "scraper_health": build_scraper_health_snapshot(),
         "db_path": DB_PATH,
         "monitor_started": _started,
     })
