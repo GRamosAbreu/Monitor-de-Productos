@@ -4,7 +4,9 @@ import time
 import uuid
 import sqlite3
 import logging
+import random
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from collections import Counter
 from contextlib import contextmanager
@@ -68,6 +70,13 @@ WALLAPOP_APP_VERSION = env_str("WALLAPOP_APP_VERSION", "8.1737.0")
 WALLAPOP_APP_VERSION_HEADER = env_str("WALLAPOP_APP_VERSION_HEADER", WALLAPOP_APP_VERSION.replace(".", ""))
 FILTER_TODAY_ONLY = env_bool("FILTER_TODAY_ONLY", True)
 PORT = int(env_str("PORT", "8080"))
+MAX_CONCURRENT_RULES = max(1, int(env_str("MAX_CONCURRENT_RULES", "3")))
+RULE_BATCH_PAUSE_SECONDS = max(0.0, float(env_str("RULE_BATCH_PAUSE_SECONDS", "5")))
+RULE_START_STAGGER_MIN_SECONDS = max(0.0, float(env_str("RULE_START_STAGGER_MIN_SECONDS", "0.35")))
+RULE_START_STAGGER_MAX_SECONDS = max(
+    RULE_START_STAGGER_MIN_SECONDS,
+    float(env_str("RULE_START_STAGGER_MAX_SECONDS", "1.10")),
+)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -738,17 +747,65 @@ def process_rule(rule: sqlite3.Row):
     )
 
 
+def batched_rules(rules: list[sqlite3.Row], batch_size: int) -> list[list[sqlite3.Row]]:
+    return [rules[i:i + batch_size] for i in range(0, len(rules), batch_size)]
+
+
+def process_rule_with_stagger(rule: sqlite3.Row, slot_index: int):
+    if slot_index > 0:
+        delay = random.uniform(RULE_START_STAGGER_MIN_SECONDS, RULE_START_STAGGER_MAX_SECONDS) * slot_index
+        logging.info(
+            "Regla %s espera %.2fs antes de lanzar su bÃºsqueda en paralelo",
+            rule["name"],
+            delay,
+        )
+        time.sleep(delay)
+    process_rule(rule)
+
+
+def process_rules_round(rules: list[sqlite3.Row]):
+    if not rules:
+        return
+
+    total_batches = (len(rules) + MAX_CONCURRENT_RULES - 1) // MAX_CONCURRENT_RULES
+    for batch_index, batch in enumerate(batched_rules(rules, MAX_CONCURRENT_RULES), start=1):
+        logging.info(
+            "Lanzando lote %s/%s con %s regla(s) en paralelo (mÃ¡ximo=%s)",
+            batch_index,
+            total_batches,
+            len(batch),
+            MAX_CONCURRENT_RULES,
+        )
+
+        with ThreadPoolExecutor(max_workers=len(batch), thread_name_prefix="rule-worker") as executor:
+            futures = [
+                executor.submit(process_rule_with_stagger, rule, slot_index)
+                for slot_index, rule in enumerate(batch)
+            ]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as exc:
+                    logging.exception("Fallo inesperado procesando lote paralelo: %s", exc)
+
+        if batch_index < total_batches and RULE_BATCH_PAUSE_SECONDS > 0:
+            logging.info(
+                "Lote %s completado. Pausa de %.2fs antes del siguiente lote",
+                batch_index,
+                RULE_BATCH_PAUSE_SECONDS,
+            )
+            time.sleep(RULE_BATCH_PAUSE_SECONDS)
+
+
 def monitor_loop():
     while True:
         try:
             with db_conn() as conn:
                 cur = conn.cursor()
                 cur.execute("SELECT * FROM watch_rules WHERE is_active = 1 ORDER BY id DESC")
-                rules = cur.fetchall()
+                rules = list(cur.fetchall())
 
-            for rule in rules:
-                process_rule(rule)
-                time.sleep(5)
+            process_rules_round(rules)
         except Exception as exc:
             logging.exception("Error general del monitor: %s", exc)
 
@@ -1450,10 +1507,9 @@ def run_now():
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT * FROM watch_rules WHERE is_active = 1 ORDER BY id DESC")
-        rules = cur.fetchall()
+        rules = list(cur.fetchall())
 
-    for rule in rules:
-        process_rule(rule)
+    process_rules_round(rules)
 
     flash(f"Escaneo manual completado ({len(rules)} reglas activas)")
     return redirect(url_for("index"))
@@ -1465,6 +1521,8 @@ def health():
         "ok": True,
         "time": datetime.utcnow().isoformat() + "Z",
         "poll_seconds": POLL_SECONDS,
+        "max_concurrent_rules": MAX_CONCURRENT_RULES,
+        "rule_batch_pause_seconds": RULE_BATCH_PAUSE_SECONDS,
         "db_path": DB_PATH,
         "monitor_started": _started,
     })
