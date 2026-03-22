@@ -6,6 +6,7 @@ import sqlite3
 import logging
 import random
 import threading
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from collections import Counter, deque
@@ -14,6 +15,7 @@ from datetime import datetime, timezone
 from functools import wraps
 from typing import Any, Optional
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
@@ -70,6 +72,7 @@ WALLAPOP_APP_VERSION = env_str("WALLAPOP_APP_VERSION", "8.1737.0")
 WALLAPOP_APP_VERSION_HEADER = env_str("WALLAPOP_APP_VERSION_HEADER", WALLAPOP_APP_VERSION.replace(".", ""))
 FILTER_TODAY_ONLY = env_bool("FILTER_TODAY_ONLY", True)
 PORT = int(env_str("PORT", "8080"))
+LOCAL_TIMEZONE = env_str("LOCAL_TIMEZONE", "Europe/Madrid")
 MAX_CONCURRENT_RULES = max(1, int(env_str("MAX_CONCURRENT_RULES", "3")))
 RULE_BATCH_PAUSE_SECONDS = max(0.0, float(env_str("RULE_BATCH_PAUSE_SECONDS", "5")))
 RULE_START_STAGGER_MIN_SECONDS = max(0.0, float(env_str("RULE_START_STAGGER_MIN_SECONDS", "0.35")))
@@ -77,12 +80,20 @@ RULE_START_STAGGER_MAX_SECONDS = max(
     RULE_START_STAGGER_MIN_SECONDS,
     float(env_str("RULE_START_STAGGER_MAX_SECONDS", "1.10")),
 )
+WALLAPOP_SEARCH_MAX_PAGES = max(1, int(env_str("WALLAPOP_SEARCH_MAX_PAGES", "2")))
+RECHECK_FILTERED_AFTER_SECONDS = max(0, int(env_str("RECHECK_FILTERED_AFTER_SECONDS", "900")))
 SCRAPER_HEALTH_ALERTS_ENABLED = env_bool("SCRAPER_HEALTH_ALERTS_ENABLED", True)
 SCRAPER_HEALTH_WINDOW_SECONDS = max(60, int(env_str("SCRAPER_HEALTH_WINDOW_SECONDS", "900")))
 SCRAPER_HEALTH_ALERT_COOLDOWN_SECONDS = max(60, int(env_str("SCRAPER_HEALTH_ALERT_COOLDOWN_SECONDS", "1800")))
 SCRAPER_HEALTH_MIN_SEARCHES = max(3, int(env_str("SCRAPER_HEALTH_MIN_SEARCHES", "6")))
 SCRAPER_HEALTH_MIN_PROBLEMS = max(1, int(env_str("SCRAPER_HEALTH_MIN_PROBLEMS", "3")))
 SCRAPER_HEALTH_PROBLEM_RATIO = min(1.0, max(0.0, float(env_str("SCRAPER_HEALTH_PROBLEM_RATIO", "0.50"))))
+
+try:
+    LOCAL_TZ = ZoneInfo(LOCAL_TIMEZONE)
+except Exception:
+    logging.warning("Zona horaria invalida %s; usando UTC", LOCAL_TIMEZONE)
+    LOCAL_TZ = timezone.utc
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -171,6 +182,21 @@ def init_db():
             )
             """
         )
+        cur.execute("PRAGMA table_info(seen_items)")
+        seen_items_columns = {row[1] for row in cur.fetchall()}
+        if "decision" not in seen_items_columns:
+            cur.execute("ALTER TABLE seen_items ADD COLUMN decision TEXT")
+        if "last_checked_ts" not in seen_items_columns:
+            cur.execute("ALTER TABLE seen_items ADD COLUMN last_checked_ts REAL")
+        cur.execute(
+            """
+            UPDATE seen_items
+            SET
+                decision = COALESCE(decision, 'legacy_seen'),
+                last_checked_ts = COALESCE(last_checked_ts, strftime('%s', 'now'))
+            WHERE decision IS NULL OR last_checked_ts IS NULL
+            """
+        )
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS notifications_log (
@@ -223,7 +249,10 @@ def login_required(view_func):
 def normalize_text(text: Optional[str]) -> str:
     if not text:
         return ""
-    return re.sub(r"\s+", " ", text).strip().lower()
+    collapsed = re.sub(r"\s+", " ", str(text)).strip().lower()
+    return "".join(
+        char for char in unicodedata.normalize("NFKD", collapsed) if not unicodedata.combining(char)
+    )
 
 
 def compact_text(text: Optional[str]) -> str:
@@ -388,7 +417,12 @@ def record_scraper_search_outcome(
 
 
 def build_search_url(rule: sqlite3.Row) -> str:
-    params = {
+    params = build_wallapop_search_params(rule)
+    return f"https://es.wallapop.com/search?{urlencode(params)}"
+
+
+def build_wallapop_search_params(rule: sqlite3.Row, *, next_page: Optional[str] = None) -> dict[str, Any]:
+    params: dict[str, Any] = {
         "keywords": rule["keywords"],
         "source": "search_box",
         "order_by": "newest",
@@ -399,7 +433,18 @@ def build_search_url(rule: sqlite3.Row) -> str:
         params["min_sale_price"] = rule["min_price"]
     if rule["max_price"] is not None:
         params["max_sale_price"] = rule["max_price"]
-    return f"https://es.wallapop.com/search?{urlencode(params)}"
+
+    try:
+        category_id = int(rule["category_id"]) if rule["category_id"] is not None else None
+    except Exception:
+        category_id = None
+    if category_id is not None:
+        params["category_id"] = category_id
+
+    if next_page:
+        params["next_page"] = next_page
+
+    return params
 
 
 def build_wallapop_api_headers(referer_url: str) -> dict[str, str]:
@@ -526,14 +571,69 @@ def extract_taxonomy_ids(item: dict[str, Any]) -> list[int]:
     return ids
 
 
-def is_created_today_utc(created_at_ms: Any) -> bool:
+def is_created_today_local(created_at_ms: Any) -> bool:
     if created_at_ms is None:
         return False
     try:
-        created_dt = datetime.fromtimestamp(float(created_at_ms) / 1000.0, tz=timezone.utc)
+        created_dt = datetime.fromtimestamp(float(created_at_ms) / 1000.0, tz=timezone.utc).astimezone(LOCAL_TZ)
     except Exception:
         return False
-    return created_dt.date() == datetime.now(timezone.utc).date()
+    return created_dt.date() == datetime.now(LOCAL_TZ).date()
+
+
+def extract_wallapop_items(payload: dict[str, Any], search_url: str) -> tuple[list[dict[str, Any]], Optional[str]]:
+    data = payload.get("data", {})
+    section = data.get("section", {}) if isinstance(data, dict) else {}
+    section_payload = section.get("payload", {}) if isinstance(section, dict) else {}
+    raw_items = section_payload.get("items", []) if isinstance(section_payload, dict) else []
+
+    items: list[dict[str, Any]] = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        created_at = raw.get("created_at")
+        if FILTER_TODAY_ONLY and not is_created_today_local(created_at):
+            continue
+        taxonomy_ids = extract_taxonomy_ids(raw)
+
+        item_id = str(raw.get("id") or "").strip()
+        web_slug = str(raw.get("web_slug") or "").strip()
+        if not item_id:
+            item_id = web_slug
+        if not item_id:
+            continue
+
+        item_url = f"https://es.wallapop.com/item/{web_slug}" if web_slug else search_url
+        items.append(
+            {
+                "item_id": item_id,
+                "title": str(raw.get("title") or "").strip(),
+                "description": str(raw.get("description") or "").strip(),
+                "price": extract_price_amount(raw),
+                "url": item_url,
+                "created_at": created_at,
+                "category_id": raw.get("category_id"),
+                "taxonomy_ids": taxonomy_ids,
+            }
+        )
+
+    next_page = None
+    for candidate in (
+        section_payload.get("next_page") if isinstance(section_payload, dict) else None,
+        section_payload.get("nextPage") if isinstance(section_payload, dict) else None,
+        section.get("next_page") if isinstance(section, dict) else None,
+        section.get("nextPage") if isinstance(section, dict) else None,
+        data.get("next_page") if isinstance(data, dict) else None,
+        data.get("nextPage") if isinstance(data, dict) else None,
+        payload.get("next_page"),
+        payload.get("nextPage"),
+    ):
+        candidate_str = str(candidate or "").strip()
+        if candidate_str:
+            next_page = candidate_str
+            break
+
+    return items, next_page
 
 
 def fetch_search_results_legacy_html(search_url: str) -> list[dict]:
@@ -597,63 +697,39 @@ def fetch_search_results_with_fallback(
 
 def fetch_search_results(rule: sqlite3.Row) -> list[dict]:
     search_url = build_search_url(rule)
-    params: dict[str, Any] = {
-        "keywords": rule["keywords"],
-        "source": "search_box",
-        "order_by": "newest",
-    }
-    if FILTER_TODAY_ONLY:
-        params["time_filter"] = "today"
-    if rule["min_price"] is not None:
-        params["min_sale_price"] = rule["min_price"]
-    if rule["max_price"] is not None:
-        params["max_sale_price"] = rule["max_price"]
-
     api_headers = build_wallapop_api_headers(search_url)
     try:
-        response = requests.get("https://api.wallapop.com/api/v3/search", params=params, headers=api_headers, timeout=30)
-        response.raise_for_status()
-        payload = response.json()
-        raw_items = (
-            payload.get("data", {})
-            .get("section", {})
-            .get("payload", {})
-            .get("items", [])
+        page_items: list[dict[str, Any]] = []
+        seen_item_ids: set[str] = set()
+        next_page: Optional[str] = None
+        pages_loaded = 0
+
+        while pages_loaded < WALLAPOP_SEARCH_MAX_PAGES:
+            params = build_wallapop_search_params(rule, next_page=next_page)
+            response = requests.get("https://api.wallapop.com/api/v3/search", params=params, headers=api_headers, timeout=30)
+            response.raise_for_status()
+            payload = response.json()
+            items, next_page = extract_wallapop_items(payload, search_url)
+
+            for item in items:
+                item_id = item["item_id"]
+                if item_id in seen_item_ids:
+                    continue
+                seen_item_ids.add(item_id)
+                page_items.append(item)
+
+            pages_loaded += 1
+            if not next_page:
+                break
+
+        logging.info(
+            "Wallapop API: %s resultados para %s (paginas=%s)",
+            len(page_items),
+            rule["name"],
+            pages_loaded,
         )
-
-        items: list[dict] = []
-        for raw in raw_items:
-            if not isinstance(raw, dict):
-                continue
-            created_at = raw.get("created_at")
-            if FILTER_TODAY_ONLY and not is_created_today_utc(created_at):
-                continue
-            taxonomy_ids = extract_taxonomy_ids(raw)
-
-            item_id = str(raw.get("id") or "").strip()
-            web_slug = str(raw.get("web_slug") or "").strip()
-            if not item_id:
-                item_id = web_slug
-            if not item_id:
-                continue
-
-            item_url = f"https://es.wallapop.com/item/{web_slug}" if web_slug else search_url
-            items.append(
-                {
-                    "item_id": item_id,
-                    "title": str(raw.get("title") or "").strip(),
-                    "description": str(raw.get("description") or "").strip(),
-                    "price": extract_price_amount(raw),
-                    "url": item_url,
-                    "created_at": created_at,
-                    "category_id": raw.get("category_id"),
-                    "taxonomy_ids": taxonomy_ids,
-                }
-            )
-
-        logging.info("Wallapop API: %s resultados para %s", len(items), rule["name"])
-        record_scraper_search_outcome(rule["name"], "api_ok", result_count=len(items))
-        return items
+        record_scraper_search_outcome(rule["name"], "api_ok", result_count=len(page_items))
+        return page_items
     except requests.exceptions.HTTPError as exc:
         status_code = exc.response.status_code if exc.response is not None else None
         logging.exception("Fallo HTTP en API de Wallapop, usando fallback HTML: %s", exc)
@@ -703,11 +779,9 @@ def rule_match_details(rule: sqlite3.Row, title: str, description: str) -> tuple
         starts_with_raw = None
     starts_with_terms = split_csv(starts_with_raw)
     if starts_with_terms:
-        title_first = first_word(title_n)
-        allowed_first_words = [first_word(term) for term in starts_with_terms]
-        allowed_first_words = [word for word in allowed_first_words if word]
-        if allowed_first_words and title_first not in allowed_first_words:
-            reasons.append(f"title_starts_with:{'|'.join(allowed_first_words)}")
+        allowed_starts = [normalize_text(term) for term in starts_with_terms if normalize_text(term)]
+        if allowed_starts and not any(title_n.startswith(start) for start in allowed_starts):
+            reasons.append(f"title_starts_with:{'|'.join(allowed_starts)}")
 
     for term in split_csv(rule["title_must_not_include"]):
         if contains_phrase(title_n, term):
@@ -745,25 +819,52 @@ def rule_matches(rule: sqlite3.Row, title: str, description: str) -> bool:
     return ok
 
 
-def already_seen(watch_id: int, item_id: str) -> bool:
+def should_skip_item(watch_id: int, item_id: str) -> bool:
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT 1 FROM seen_items WHERE watch_id = ? AND item_id = ?",
+            "SELECT decision, last_checked_ts FROM seen_items WHERE watch_id = ? AND item_id = ?",
             (watch_id, item_id),
         )
-        return cur.fetchone() is not None
+        row = cur.fetchone()
+        if row is None:
+            return False
+
+        decision = str(row["decision"] or "").strip().lower()
+        if decision in {"notified", "legacy_seen"}:
+            return True
+
+        try:
+            last_checked_ts = float(row["last_checked_ts"])
+        except Exception:
+            return False
+
+        return (time.time() - last_checked_ts) < RECHECK_FILTERED_AFTER_SECONDS
 
 
-def mark_seen(watch_id: int, item_id: str, title: str, price: Optional[float], url: str):
+def record_item_decision(
+    watch_id: int,
+    item_id: str,
+    title: str,
+    price: Optional[float],
+    url: str,
+    decision: str,
+):
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT OR IGNORE INTO seen_items (item_id, watch_id, title, price, url)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO seen_items (item_id, watch_id, title, price, url, decision, last_checked_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(item_id, watch_id) DO UPDATE SET
+                title = excluded.title,
+                price = excluded.price,
+                url = excluded.url,
+                decision = excluded.decision,
+                last_checked_ts = excluded.last_checked_ts,
+                seen_at = CURRENT_TIMESTAMP
             """,
-            (item_id, watch_id, title, price, url),
+            (item_id, watch_id, title, price, url, decision, time.time()),
         )
 
 
@@ -801,6 +902,7 @@ def process_rule(rule: sqlite3.Row):
         "price_filtered": 0,
         "category_filtered": 0,
         "criteria_filtered": 0,
+        "telegram_failed": 0,
         "sent": 0,
     }
     criteria_reasons = Counter()
@@ -818,7 +920,7 @@ def process_rule(rule: sqlite3.Row):
             except Exception:
                 continue
 
-        if already_seen(rule["id"], item_id):
+        if should_skip_item(rule["id"], item_id):
             stats["already_seen"] += 1
             continue
 
@@ -826,17 +928,17 @@ def process_rule(rule: sqlite3.Row):
             stats["category_filtered"] += 1
             stats["criteria_filtered"] += 1
             criteria_reasons[f"category:{rule_category_id}"] += 1
-            mark_seen(rule["id"], item_id, title, price, url)
+            record_item_decision(rule["id"], item_id, title, price, url, "filtered_category")
             continue
 
         if rule["max_price"] is not None and price is not None and price > rule["max_price"]:
             stats["price_filtered"] += 1
-            mark_seen(rule["id"], item_id, title, price, url)
+            record_item_decision(rule["id"], item_id, title, price, url, "filtered_price")
             continue
 
         if rule["min_price"] is not None and price is not None and price < rule["min_price"]:
             stats["price_filtered"] += 1
-            mark_seen(rule["id"], item_id, title, price, url)
+            record_item_decision(rule["id"], item_id, title, price, url, "filtered_price")
             continue
 
         description = str(item.get("description") or "").strip()
@@ -867,7 +969,7 @@ def process_rule(rule: sqlite3.Row):
             stats["criteria_filtered"] += 1
             for reason in reasons:
                 criteria_reasons[reason] += 1
-            mark_seen(rule["id"], item_id, title, price, url)
+            record_item_decision(rule["id"], item_id, title, price, url, "filtered_criteria")
             continue
 
         message = (
@@ -879,8 +981,12 @@ def process_rule(rule: sqlite3.Row):
         )
         ok, status = send_telegram(message)
         log_notification(rule["id"], item_id, title, price, url, status if ok else f"ERROR: {status}")
-        mark_seen(rule["id"], item_id, title, price, url)
-        stats["sent"] += 1
+        if ok:
+            record_item_decision(rule["id"], item_id, title, price, url, "notified")
+            stats["sent"] += 1
+        else:
+            record_item_decision(rule["id"], item_id, title, price, url, "send_failed")
+            stats["telegram_failed"] += 1
         time.sleep(2)
 
     if criteria_reasons:
@@ -888,13 +994,14 @@ def process_rule(rule: sqlite3.Row):
     else:
         top_reasons = "-"
     logging.info(
-        "Resumen regla %s -> total=%s | vistos=%s | precio=%s | categoria=%s | criterio=%s | enviados=%s | top_descartes=%s",
+        "Resumen regla %s -> total=%s | vistos=%s | precio=%s | categoria=%s | criterio=%s | telegram_failed=%s | enviados=%s | top_descartes=%s",
         rule["name"],
         stats["total"],
         stats["already_seen"],
         stats["price_filtered"],
         stats["category_filtered"],
         stats["criteria_filtered"],
+        stats["telegram_failed"],
         stats["sent"],
         top_reasons,
     )
