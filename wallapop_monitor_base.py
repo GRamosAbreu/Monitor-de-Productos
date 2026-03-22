@@ -1057,12 +1057,6 @@ def process_rule(rule: sqlite3.Row):
             f"Título: {title}",
             f"Precio: {price if price is not None else 'No detectado'} €",
         ]
-        if distance_km is not None:
-            distance_text = f"{distance_km:.1f} km"
-            location_label = str(item.get("location_label") or "").strip()
-            if location_label:
-                distance_text = f"{distance_text} ({location_label})"
-            message_lines.append(f"Distancia: {distance_text}")
         message_lines.append(f"URL: {url}")
         message = "\n".join(message_lines)
         ok, status = send_telegram(message)
