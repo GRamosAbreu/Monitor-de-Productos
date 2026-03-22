@@ -7,6 +7,7 @@ import logging
 import random
 import threading
 import unicodedata
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from collections import Counter, deque
@@ -61,6 +62,13 @@ def env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return float(raw.strip())
+
+
 load_local_env()
 APP_SECRET = env_str("APP_SECRET", "cambia-esta-clave")
 APP_PASSWORD = env_str("APP_PASSWORD", "cambia-esta-password")
@@ -73,6 +81,9 @@ WALLAPOP_APP_VERSION_HEADER = env_str("WALLAPOP_APP_VERSION_HEADER", WALLAPOP_AP
 FILTER_TODAY_ONLY = env_bool("FILTER_TODAY_ONLY", True)
 PORT = int(env_str("PORT", "8080"))
 LOCAL_TIMEZONE = env_str("LOCAL_TIMEZONE", "Europe/Madrid")
+LOCAL_REFERENCE_LATITUDE = env_float("LOCAL_REFERENCE_LATITUDE", 37.3891)
+LOCAL_REFERENCE_LONGITUDE = env_float("LOCAL_REFERENCE_LONGITUDE", -5.9845)
+LOCAL_CHOLLO_MAX_KM = max(0.1, env_float("LOCAL_CHOLLO_MAX_KM", 15.0))
 MAX_CONCURRENT_RULES = max(1, int(env_str("MAX_CONCURRENT_RULES", "5")))
 RULE_BATCH_PAUSE_SECONDS = max(0.0, float(env_str("RULE_BATCH_PAUSE_SECONDS", "5")))
 RULE_START_STAGGER_MIN_SECONDS = max(0.0, float(env_str("RULE_START_STAGGER_MIN_SECONDS", "0.35")))
@@ -549,6 +560,64 @@ def extract_price_amount(item: dict[str, Any]) -> Optional[float]:
     return None
 
 
+def extract_location_coordinates(item: dict[str, Any]) -> tuple[Optional[float], Optional[float], str]:
+    location = item.get("location")
+    if not isinstance(location, dict):
+        return None, None, ""
+
+    try:
+        latitude = float(location.get("latitude"))
+    except Exception:
+        latitude = None
+
+    try:
+        longitude = float(location.get("longitude"))
+    except Exception:
+        longitude = None
+
+    city = str(location.get("city") or "").strip()
+    region = str(location.get("region2") or location.get("region") or "").strip()
+    location_parts = [part for part in [city, region] if part]
+    return latitude, longitude, ", ".join(location_parts)
+
+
+def haversine_distance_km(
+    latitude_a: float,
+    longitude_a: float,
+    latitude_b: float,
+    longitude_b: float,
+) -> float:
+    earth_radius_km = 6371.0
+    lat1 = math.radians(latitude_a)
+    lon1 = math.radians(longitude_a)
+    lat2 = math.radians(latitude_b)
+    lon2 = math.radians(longitude_b)
+    delta_lat = lat2 - lat1
+    delta_lon = lon2 - lon1
+
+    hav = (
+        math.sin(delta_lat / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2) ** 2
+    )
+    return 2 * earth_radius_km * math.asin(math.sqrt(hav))
+
+
+def calculate_item_distance_km(item: dict[str, Any]) -> Optional[float]:
+    latitude = item.get("location_latitude")
+    longitude = item.get("location_longitude")
+    if latitude is None or longitude is None:
+        return None
+    try:
+        return haversine_distance_km(
+            LOCAL_REFERENCE_LATITUDE,
+            LOCAL_REFERENCE_LONGITUDE,
+            float(latitude),
+            float(longitude),
+        )
+    except Exception:
+        return None
+
+
 def extract_taxonomy_ids(item: dict[str, Any]) -> list[int]:
     ids: list[int] = []
 
@@ -595,6 +664,7 @@ def extract_wallapop_items(payload: dict[str, Any], search_url: str) -> tuple[li
         if FILTER_TODAY_ONLY and not is_created_today_local(created_at):
             continue
         taxonomy_ids = extract_taxonomy_ids(raw)
+        location_latitude, location_longitude, location_label = extract_location_coordinates(raw)
 
         item_id = str(raw.get("id") or "").strip()
         web_slug = str(raw.get("web_slug") or "").strip()
@@ -614,6 +684,9 @@ def extract_wallapop_items(payload: dict[str, Any], search_url: str) -> tuple[li
                 "created_at": created_at,
                 "category_id": raw.get("category_id"),
                 "taxonomy_ids": taxonomy_ids,
+                "location_latitude": location_latitude,
+                "location_longitude": location_longitude,
+                "location_label": location_label,
             }
         )
 
@@ -662,6 +735,9 @@ def fetch_search_results_legacy_html(search_url: str) -> list[dict]:
                 "created_at": None,
                 "category_id": None,
                 "taxonomy_ids": [],
+                "location_latitude": None,
+                "location_longitude": None,
+                "location_label": "",
             }
         )
     return items
@@ -912,6 +988,8 @@ def process_rule(rule: sqlite3.Row):
         title = item["title"]
         price = item["price"]
         url = item["url"]
+        distance_km = calculate_item_distance_km(item)
+        is_local_chollo = distance_km is not None and distance_km <= LOCAL_CHOLLO_MAX_KM
 
         item_category_ids: set[int] = set()
         for raw_category in item.get("taxonomy_ids", []):
@@ -972,13 +1050,21 @@ def process_rule(rule: sqlite3.Row):
             record_item_decision(rule["id"], item_id, title, price, url, "filtered_criteria")
             continue
 
-        message = (
-            f"🟢 Chollo detectado\n"
-            f"Regla: {rule['name']}\n"
-            f"Título: {title}\n"
-            f"Precio: {price if price is not None else 'No detectado'} €\n"
-            f"URL: {url}"
-        )
+        header = "🔴 Chollo local detectado" if is_local_chollo else "🟢 Chollo detectado"
+        message_lines = [
+            header,
+            f"Regla: {rule['name']}",
+            f"Título: {title}",
+            f"Precio: {price if price is not None else 'No detectado'} €",
+        ]
+        if distance_km is not None:
+            distance_text = f"{distance_km:.1f} km"
+            location_label = str(item.get("location_label") or "").strip()
+            if location_label:
+                distance_text = f"{distance_text} ({location_label})"
+            message_lines.append(f"Distancia: {distance_text}")
+        message_lines.append(f"URL: {url}")
+        message = "\n".join(message_lines)
         ok, status = send_telegram(message)
         log_notification(rule["id"], item_id, title, price, url, status if ok else f"ERROR: {status}")
         if ok:
