@@ -65,7 +65,7 @@ load_local_env()
 APP_SECRET = env_str("APP_SECRET", "cambia-esta-clave")
 APP_PASSWORD = env_str("APP_PASSWORD", "cambia-esta-password")
 DB_PATH = env_str("DB_PATH", "wallapop_app.db")
-POLL_SECONDS = int(env_str("POLL_SECONDS", "300"))  # 5 minutos
+POLL_SECONDS = int(env_str("POLL_SECONDS", "150"))  # 2.5 minutos
 TELEGRAM_BOT_TOKEN = env_str("TELEGRAM_BOT_TOKEN", "PON_AQUI_TU_BOT_TOKEN")
 TELEGRAM_CHAT_ID = env_str("TELEGRAM_CHAT_ID", "PON_AQUI_TU_CHAT_ID")
 WALLAPOP_APP_VERSION = env_str("WALLAPOP_APP_VERSION", "8.1737.0")
@@ -73,7 +73,7 @@ WALLAPOP_APP_VERSION_HEADER = env_str("WALLAPOP_APP_VERSION_HEADER", WALLAPOP_AP
 FILTER_TODAY_ONLY = env_bool("FILTER_TODAY_ONLY", True)
 PORT = int(env_str("PORT", "8080"))
 LOCAL_TIMEZONE = env_str("LOCAL_TIMEZONE", "Europe/Madrid")
-MAX_CONCURRENT_RULES = max(1, int(env_str("MAX_CONCURRENT_RULES", "3")))
+MAX_CONCURRENT_RULES = max(1, int(env_str("MAX_CONCURRENT_RULES", "5")))
 RULE_BATCH_PAUSE_SECONDS = max(0.0, float(env_str("RULE_BATCH_PAUSE_SECONDS", "5")))
 RULE_START_STAGGER_MIN_SECONDS = max(0.0, float(env_str("RULE_START_STAGGER_MIN_SECONDS", "0.35")))
 RULE_START_STAGGER_MAX_SECONDS = max(
